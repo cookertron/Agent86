@@ -1,0 +1,31 @@
+# Build artifacts
+*.obj
+*.exe
+*.com
+*.dbg
+*.pdb
+*.ilk
+
+# Temp/scratch files
+stderr.txt
+stdout.txt
+trace.txt
+test.txt
+nul
+
+# Reference materials (too large)
+X86_Opcode_and_Instruction_reference.html
+X86_Opcode_and_Instruction_reference_files/
+
+# Internal dev notes
+_plan_raw.txt
+indexing_methods.md
+jump_strategy.md
+vm_challenge.md
+BUG_CTRL_MODIFIER.md
+
+# External binaries
+TEDIT.com
+
+# Claude Code local settings
+.claude/

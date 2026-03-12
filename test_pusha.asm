@@ -1,0 +1,4 @@
+ORG 100h
+PUSHA
+POPA
+INT 20h
