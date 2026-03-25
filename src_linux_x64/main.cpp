@@ -271,7 +271,7 @@ static std::string loadEventsArg(const std::string& arg,
 // ---- Help system: --help [flag] ----
 
 static void helpOverview() {
-    std::cout << R"HELP(agent86 v0.19.2 -- 8086 assembler + JIT emulator for .COM binaries
+    std::cout << R"HELP(agent86 v0.20.0 -- 8086 assembler + JIT emulator for .COM binaries
 
 USAGE
   agent86 <file.asm>                   Assemble to <file.com>
@@ -321,6 +321,7 @@ JSON SHAPES
                   With VRAMOUT modifier: includes "screen":{...}
   Assert fail:    {"executed":"ASSERT_FAILED","addr":N,"assert":"...","actual":N,"expected":N,"instructions":N}
                   With VRAMOUT modifier: includes "screen":{...}
+  Mem assert:     {"executed":"ASSERT_FAILED","addr":N,"assert":"MEM_ASSERT ...","snap_name":"...","mismatch_offset":N,"expected":N,"actual":N,"instructions":N}
 )HELP" << std::flush;
 }
 
@@ -411,6 +412,7 @@ JSON OUTPUT (stdout)
   {"executed":"OK","instructions":N}
   {"executed":"BREAKPOINT","addr":N,"instructions":N}
   {"executed":"ASSERT_FAILED","addr":N,"assert":"...","actual":N,"expected":N,"instructions":N}
+  {"executed":"ASSERT_FAILED","addr":N,"assert":"MEM_ASSERT ...","snap_name":"...","mismatch_offset":N,...}
 
 EXAMPLES
   agent86 prog.asm && agent86 prog.com --trace
@@ -609,6 +611,57 @@ RUNTIME DIRECTIVES
 
     The label is for deduplication only -- it does not define an assembly
     symbol. Multiple LOG_ONCE with the same label only fire the first one.
+
+  DOS_FAIL <int_num>, <ah_func> [, <error_code>]
+    Arms a one-shot DOS failure. The next INT <int_num> with AH=<ah_func>
+    will skip the real DOS call, set CF=1, and return AX=<error_code>.
+    Default error code is 5 (access denied). One-shot: subsequent calls
+    succeed normally.
+
+      DOS_FAIL 21h, 3Ch            ; next file create fails (AX=5)
+      DOS_FAIL 21h, 3Ch, 3         ; next file create fails (AX=3, path not found)
+      DOS_FAIL 21h, 48h, 8         ; next memory alloc fails (AX=8, insufficient memory)
+
+  DOS_PARTIAL <int_num>, <ah_func>, <count>
+    Arms a one-shot partial result. The next INT <int_num> with AH=<ah_func>
+    will skip the real DOS call, set CF=0, and return AX=<count>.
+    Useful for testing partial-write handling.
+
+      DOS_PARTIAL 21h, 40h, 10     ; next write returns only 10 bytes written
+      DOS_PARTIAL 21h, 40h, 0      ; next write returns 0 bytes written
+
+  MEM_SNAPSHOT <name>, <seg_reg>, <offset>, <length>
+    Capture a named copy of <length> bytes at <seg_reg>:<offset>.
+    The segment register (ES/CS/SS/DS) is resolved at runtime.
+    Offset and length may be expressions (labels, EQU, arithmetic).
+    Max 32 concurrent snapshots, max 65536 bytes each.
+
+      MEM_SNAPSHOT pt_before, ES, 0, 100      ; save ES:0000..0063h
+      MEM_SNAPSHOT buf_snap, DS, my_buf, 64   ; save DS:my_buf, 64 bytes
+      MEM_SNAPSHOT hdr, DS, buf+4, BUF_LEN    ; label offset + EQU length
+
+  MEM_ASSERT <name>, <seg_reg>, <offset>, <length>
+    Compare current memory at <seg_reg>:<offset> against a previously
+    captured snapshot with the same name. Halts with ASSERT_FAILED on
+    the first byte that differs, reporting the offset, expected, and
+    actual values. Also halts if no snapshot with <name> was captured.
+
+      MEM_ASSERT pt_before, ES, 0, 100       ; verify region unchanged
+      MEM_ASSERT buf_snap, DS, my_buf, 64    ; compare against saved copy
+
+    Typical pattern -- verify a call doesn't corrupt a region:
+      MEM_SNAPSHOT s, DS, table, 100
+      CALL risky_function
+      MEM_ASSERT s, DS, table, 100            ; passes if table unchanged
+
+    JSON on mismatch:
+      {"executed":"ASSERT_FAILED","addr":N,"assert":"MEM_ASSERT s",
+       "snap_name":"s","mismatch_offset":42,"expected":255,"actual":0,
+       "instructions":N}
+
+    JSON when snapshot not found:
+      {"executed":"ASSERT_FAILED","addr":N,"assert":"MEM_ASSERT s (no snapshot)",
+       "snap_name":"s","instructions":N}
 )HELP" << std::flush;
 }
 
@@ -775,7 +828,8 @@ WORKFLOW
   agent86 prog.com --trace           Trace pre-compiled .COM
 
   Parse the JSON stdout to check results. Fix errors and repeat.
-  See --help directives for ASSERT, PRINT, HEX_START, ASSERT_EQ, VRAMOUT.
+  See --help directives for ASSERT, PRINT, HEX_START, ASSERT_EQ, VRAMOUT,
+    MEM_SNAPSHOT, MEM_ASSERT, DOS_FAIL, DOS_PARTIAL, LOG, REGS.
 )HELP" << std::flush;
 }
 
@@ -1238,12 +1292,23 @@ int main(int argc, char* argv[]) {
                         case DebugDirective::REGS:        type_str = "regs"; break;
                         case DebugDirective::LOG:         type_str = "log"; break;
                         case DebugDirective::LOG_ONCE:    type_str = "log_once"; break;
+                        case DebugDirective::DOS_FAIL:    type_str = "dos_fail"; break;
+                        case DebugDirective::DOS_PARTIAL: type_str = "dos_partial"; break;
+                        case DebugDirective::MEM_SNAPSHOT: type_str = "mem_snapshot"; break;
+                        case DebugDirective::MEM_ASSERT:   type_str = "mem_assert"; break;
                     }
                     dbg << "{\"type\":\"" << type_str
                         << "\",\"addr\":" << directives[i].addr
                         << ",\"count\":" << directives[i].count;
                     if (!directives[i].label.empty()) {
                         dbg << ",\"name\":\"" << jsonEscape(directives[i].label) << "\"";
+                    }
+                    if (directives[i].type == DebugDirective::MEM_SNAPSHOT ||
+                        directives[i].type == DebugDirective::MEM_ASSERT) {
+                        dbg << ",\"snap_name\":\"" << jsonEscape(directives[i].snap_name) << "\""
+                            << ",\"snap_seg\":" << directives[i].snap_seg
+                            << ",\"snap_offset\":" << directives[i].snap_offset
+                            << ",\"snap_length\":" << directives[i].snap_length;
                     }
                     if (directives[i].type == DebugDirective::LOG ||
                         directives[i].type == DebugDirective::LOG_ONCE) {
@@ -1265,6 +1330,8 @@ int main(int argc, char* argv[]) {
                                     << ",\"reg_index\":" << directives[i].reg_index;
                             } else {
                                 dbg << ",\"mem_addr\":" << directives[i].mem_addr;
+                                if (directives[i].mem_seg >= 0)
+                                    dbg << ",\"mem_seg\":" << directives[i].mem_seg;
                             }
                         }
                     }
@@ -1282,6 +1349,8 @@ int main(int argc, char* argv[]) {
                                 << ",\"reg_index\":" << directives[i].reg_index;
                         } else {
                             dbg << ",\"mem_addr\":" << directives[i].mem_addr;
+                            if (directives[i].mem_seg >= 0)
+                                dbg << ",\"mem_seg\":" << directives[i].mem_seg;
                         }
                         dbg << ",\"expected\":" << directives[i].expected;
                     }
@@ -1300,6 +1369,15 @@ int main(int argc, char* argv[]) {
                     }
                     if (directives[i].regs) {
                         dbg << ",\"regs\":true";
+                    }
+                    if (directives[i].type == DebugDirective::DOS_FAIL ||
+                        directives[i].type == DebugDirective::DOS_PARTIAL) {
+                        dbg << ",\"int_num\":" << (int)directives[i].int_num
+                            << ",\"ah_func\":" << (int)directives[i].ah_func;
+                        if (directives[i].type == DebugDirective::DOS_FAIL)
+                            dbg << ",\"fail_code\":" << directives[i].fail_code;
+                        else
+                            dbg << ",\"partial_count\":" << directives[i].partial_count;
                     }
                     dbg << "}";
                 }
@@ -1487,12 +1565,26 @@ int main(int argc, char* argv[]) {
                     case DebugDirective::BREAKPOINT:  type_str = "breakpoint"; break;
                     case DebugDirective::ASSERT_EQ:   type_str = "assert_eq"; break;
                     case DebugDirective::VRAMOUT:     type_str = "vramout"; break;
+                    case DebugDirective::REGS:        type_str = "regs"; break;
+                    case DebugDirective::LOG:         type_str = "log"; break;
+                    case DebugDirective::LOG_ONCE:    type_str = "log_once"; break;
+                    case DebugDirective::DOS_FAIL:    type_str = "dos_fail"; break;
+                    case DebugDirective::DOS_PARTIAL: type_str = "dos_partial"; break;
+                    case DebugDirective::MEM_SNAPSHOT: type_str = "mem_snapshot"; break;
+                    case DebugDirective::MEM_ASSERT:   type_str = "mem_assert"; break;
                 }
                 dbg << "{\"type\":\"" << type_str
                     << "\",\"addr\":" << directives[i].addr
                     << ",\"count\":" << directives[i].count;
                 if (!directives[i].label.empty()) {
                     dbg << ",\"name\":\"" << jsonEscape(directives[i].label) << "\"";
+                }
+                if (directives[i].type == DebugDirective::MEM_SNAPSHOT ||
+                    directives[i].type == DebugDirective::MEM_ASSERT) {
+                    dbg << ",\"snap_name\":\"" << jsonEscape(directives[i].snap_name) << "\""
+                        << ",\"snap_seg\":" << directives[i].snap_seg
+                        << ",\"snap_offset\":" << directives[i].snap_offset
+                        << ",\"snap_length\":" << directives[i].snap_length;
                 }
                 if (directives[i].type == DebugDirective::ASSERT_EQ) {
                     const char* check_str = "none";
@@ -1508,6 +1600,8 @@ int main(int argc, char* argv[]) {
                             << ",\"reg_index\":" << directives[i].reg_index;
                     } else {
                         dbg << ",\"mem_addr\":" << directives[i].mem_addr;
+                        if (directives[i].mem_seg >= 0)
+                            dbg << ",\"mem_seg\":" << directives[i].mem_seg;
                     }
                     dbg << ",\"expected\":" << directives[i].expected;
                 }
@@ -1523,6 +1617,18 @@ int main(int argc, char* argv[]) {
                             << ",\"h\":" << directives[i].vramout.h;
                     }
                     dbg << "}";
+                }
+                if (directives[i].regs) {
+                    dbg << ",\"regs\":true";
+                }
+                if (directives[i].type == DebugDirective::DOS_FAIL ||
+                    directives[i].type == DebugDirective::DOS_PARTIAL) {
+                    dbg << ",\"int_num\":" << (int)directives[i].int_num
+                        << ",\"ah_func\":" << (int)directives[i].ah_func;
+                    if (directives[i].type == DebugDirective::DOS_FAIL)
+                        dbg << ",\"fail_code\":" << directives[i].fail_code;
+                    else
+                        dbg << ",\"partial_count\":" << directives[i].partial_count;
                 }
                 dbg << "}";
             }

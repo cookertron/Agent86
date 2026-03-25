@@ -70,7 +70,6 @@ static void writeDTARecord(CPU8086& cpu, uint32_t dta_phys,
 
     // Offset 0x1E: filename (13 bytes ASCIIZ, uppercase, 8.3)
     // Extract just the filename from the path
-    // Use a copy since basename may modify the string
     char pathcopy[256];
     strncpy(pathcopy, filepath, sizeof(pathcopy) - 1);
     pathcopy[sizeof(pathcopy) - 1] = '\0';
@@ -240,21 +239,17 @@ bool handleDOSInt(CPU8086& cpu, int intNum, std::string& output,
         // ── Date/Time ────────────────────────────────────────────────────
 
         case 0x2A: {
-            // AH=2Ah — Get system date
-            time_t now = time(nullptr);
-            struct tm* t = localtime(&now);
-            cpu.regs[R_CX] = (uint16_t)(t->tm_year + 1900);
-            cpu.regs[R_DX] = (uint16_t)(((t->tm_mon + 1) << 8) | t->tm_mday);
-            cpu.regs[R_AX] = (cpu.regs[R_AX] & 0xFF00) | (uint8_t)t->tm_wday;
+            // AH=2Ah — Get system date (hardcoded)
+            cpu.regs[R_CX] = 2026;  // year
+            cpu.regs[R_DX] = (3 << 8) | 1; // DH=month(3), DL=day(1)
+            cpu.regs[R_AX] = (cpu.regs[R_AX] & 0xFF00) | 0; // AL=day of week (0=Sun)
             return true;
         }
 
         case 0x2C: {
-            // AH=2Ch — Get system time
-            time_t now = time(nullptr);
-            struct tm* t = localtime(&now);
-            cpu.regs[R_CX] = (uint16_t)((t->tm_hour << 8) | t->tm_min);
-            cpu.regs[R_DX] = (uint16_t)((t->tm_sec << 8) | 0);
+            // AH=2Ch — Get system time (hardcoded)
+            cpu.regs[R_CX] = (12 << 8) | 0;  // CH=hour, CL=min
+            cpu.regs[R_DX] = (0 << 8) | 0;   // DH=sec, DL=1/100
             return true;
         }
 
@@ -488,7 +483,7 @@ bool handleDOSInt(CPU8086& cpu, int intNum, std::string& output,
                     setError(cpu, 0x02); return true;
                 }
                 uint16_t dosAttr = 0x20; // archive
-                if (S_ISDIR(st.st_mode)) dosAttr = 0x10;
+                if (S_ISDIR(st.st_mode)) dosAttr |= 0x10;
                 if (!(st.st_mode & S_IWUSR)) dosAttr |= 0x01; // read-only
                 cpu.regs[R_CX] = dosAttr;
                 clearCF(cpu);
@@ -737,6 +732,7 @@ bool handleDOSInt(CPU8086& cpu, int intNum, std::string& output,
             int right = cpu.regs[R_DX] & 0xFF;
             if (bottom >= video.rows) bottom = video.rows - 1;
             if (right >= video.cols) right = video.cols - 1;
+            int width = right - left + 1;
             int height = bottom - top + 1;
             if (lines == 0 || lines >= height) {
                 // Clear window

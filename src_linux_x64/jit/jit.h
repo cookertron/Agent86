@@ -50,6 +50,7 @@ struct DbgAssertEq {
     int reg_index;
     std::string reg_name;
     uint16_t mem_addr;
+    int mem_seg = -1;  // segment override: -1=none, 0=ES, 1=CS, 2=SS, 3=DS
     int64_t expected;
     JitVramOutParams vramout;
     bool regs = false;
@@ -72,7 +73,25 @@ struct DbgLog {
     int reg_index = -1;
     std::string reg_name;
     uint16_t mem_addr = 0;
+    int mem_seg = -1;  // segment override: -1=none, 0=ES, 1=CS, 2=SS, 3=DS
     std::string once_label;  // non-empty for LOG_ONCE
+};
+
+struct DbgDosFail {
+    uint16_t addr;
+    uint8_t int_num;
+    uint8_t ah_func;
+    uint16_t fail_code;
+    int partial_count;  // -1 = full failure (DOS_FAIL), >=0 = partial (DOS_PARTIAL)
+};
+
+struct DbgMemSnap {
+    uint16_t addr;            // directive address (when to fire)
+    std::string name;         // snapshot identifier
+    int seg;                  // segment register index (0=ES..3=DS)
+    uint16_t offset;          // offset within segment
+    uint16_t length;          // byte count
+    bool is_assert;           // false = snapshot (capture), true = assert (compare)
 };
 
 class JitEngine {
@@ -181,6 +200,21 @@ private:
     std::unordered_set<std::string> log_once_fired_;
     std::vector<std::string> log_dumps_;
     static constexpr size_t MAX_LOG_DUMPS = 256;
+    std::vector<DbgDosFail> dos_fails_;
+    std::unordered_map<uint16_t, std::vector<size_t>> dos_fail_addr_map_;
+    struct DosFaultArmed {
+        int int_num = -1;       // -1 = not armed
+        int ah_func = -1;
+        uint16_t fail_code = 5;
+        int partial_count = -1; // -1 = full fail, >=0 = partial
+    };
+    DosFaultArmed dos_fault_;
+    // MEM_SNAPSHOT / MEM_ASSERT
+    std::vector<DbgMemSnap> mem_snaps_;
+    std::unordered_map<uint16_t, std::vector<size_t>> mem_snap_addr_map_;
+    std::unordered_map<std::string, std::vector<uint8_t>> mem_snap_buffers_;
+    static constexpr size_t MAX_SNAPSHOTS = 32;
+    static constexpr size_t MAX_SNAP_SIZE = 65536;
     bool tracing_ = false;
 
     // Idle detection: consecutive INT 16h AH=01h polls with ZF=1 (no key)

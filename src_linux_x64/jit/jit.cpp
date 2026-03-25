@@ -681,21 +681,135 @@ int JitEngine::run(const uint8_t* comData, size_t comSize, RunMode mode,
                                     val = cpu_.regs[lg.reg_index];
                                     entry += ",\"reg\":\"" + lg.reg_name + "\",\"value\":" + std::to_string(val);
                                     break;
-                                case DbgLog::CHECK_MEM_BYTE:
-                                    val = cpu_.memory[lg.mem_addr];
+                                case DbgLog::CHECK_MEM_BYTE: {
+                                    uint32_t phys = lg.mem_seg >= 0
+                                        ? ((uint32_t)cpu_.sregs[lg.mem_seg] * 16 + lg.mem_addr) & 0xFFFFF
+                                        : lg.mem_addr;
+                                    val = cpu_.memory[phys];
                                     entry += ",\"mem_addr\":" + std::to_string(lg.mem_addr)
                                            + ",\"size\":\"byte\",\"value\":" + std::to_string(val);
+                                    if (lg.mem_seg >= 0)
+                                        entry += ",\"mem_seg\":" + std::to_string(lg.mem_seg);
                                     break;
-                                case DbgLog::CHECK_MEM_WORD:
-                                    val = cpu_.memory[lg.mem_addr] | (cpu_.memory[lg.mem_addr + 1] << 8);
+                                }
+                                case DbgLog::CHECK_MEM_WORD: {
+                                    uint32_t phys = lg.mem_seg >= 0
+                                        ? ((uint32_t)cpu_.sregs[lg.mem_seg] * 16 + lg.mem_addr) & 0xFFFFF
+                                        : lg.mem_addr;
+                                    val = cpu_.memory[phys] | (cpu_.memory[(phys + 1) & 0xFFFFF] << 8);
                                     entry += ",\"mem_addr\":" + std::to_string(lg.mem_addr)
                                            + ",\"size\":\"word\",\"value\":" + std::to_string(val);
+                                    if (lg.mem_seg >= 0)
+                                        entry += ",\"mem_seg\":" + std::to_string(lg.mem_seg);
                                     break;
+                                }
                                 default: break;
                             }
                         }
                         entry += "}";
                         log_dumps_.push_back(entry);
+                    }
+                }
+            }
+
+            // DOS_FAIL / DOS_PARTIAL arming
+            auto dosf_it = dos_fail_addr_map_.find(ip);
+            if (dosf_it != dos_fail_addr_map_.end()) {
+                auto& df = dos_fails_[dosf_it->second.back()];
+                dos_fault_.int_num = df.int_num;
+                dos_fault_.ah_func = df.ah_func;
+                dos_fault_.fail_code = df.fail_code;
+                dos_fault_.partial_count = df.partial_count;
+            }
+
+            // MEM_SNAPSHOT / MEM_ASSERT
+            auto snap_it = mem_snap_addr_map_.find(ip);
+            if (snap_it != mem_snap_addr_map_.end()) {
+                for (size_t si : snap_it->second) {
+                    auto& s = mem_snaps_[si];
+                    uint32_t phys = ((uint32_t)cpu_.sregs[s.seg] * 16 + s.offset) & 0xFFFFF;
+
+                    if (!s.is_assert) {
+                        // MEM_SNAPSHOT: capture region
+                        if (mem_snap_buffers_.size() >= MAX_SNAPSHOTS &&
+                            mem_snap_buffers_.find(s.name) == mem_snap_buffers_.end()) {
+                            fprintf(stderr, "MEM_SNAPSHOT: too many snapshots (max %zu)\n", MAX_SNAPSHOTS);
+                        } else {
+                            uint16_t len = s.length;
+                            std::vector<uint8_t> buf(len);
+                            for (uint16_t b = 0; b < len; b++)
+                                buf[b] = cpu_.memory[(phys + b) & 0xFFFFF];
+                            mem_snap_buffers_[s.name] = std::move(buf);
+                        }
+                    } else {
+                        // MEM_ASSERT: compare against snapshot
+                        auto buf_it = mem_snap_buffers_.find(s.name);
+                        if (buf_it == mem_snap_buffers_.end()) {
+                            // No snapshot found — report as ASSERT_FAILED
+                            fprintf(stderr, "MEM_ASSERT FAILED at %04X: no snapshot named '%s'\n",
+                                    ip, s.name.c_str());
+                            dumpRegs();
+                            std::string af_json = "{\"executed\":\"ASSERT_FAILED\",\"addr\":" + std::to_string(ip)
+                                + ",\"assert\":\"MEM_ASSERT " + s.name + " (no snapshot)\""
+                                + ",\"snap_name\":\"" + s.name + "\""
+                                + ",\"instructions\":" + std::to_string(cpu_.instr_count);
+                            if (!log_dumps_.empty()) {
+                                af_json += ",\"log\":[";
+                                for (size_t li = 0; li < log_dumps_.size(); li++) {
+                                    if (li > 0) af_json += ",";
+                                    af_json += log_dumps_[li];
+                                }
+                                af_json += "]";
+                            }
+                            af_json += "}";
+                            std::cout << af_json << std::endl;
+                            return 1;
+                        }
+                        auto& saved = buf_it->second;
+                        uint16_t cmp_len = std::min((uint16_t)saved.size(), s.length);
+                        for (uint16_t b = 0; b < cmp_len; b++) {
+                            uint8_t actual = cpu_.memory[(phys + b) & 0xFFFFF];
+                            if (actual != saved[b]) {
+                                // Mismatch — halt with ASSERT_FAILED
+                                fprintf(stderr, "MEM_ASSERT FAILED at %04X: snapshot '%s' mismatch at offset %u: expected 0x%02X, got 0x%02X\n",
+                                        ip, s.name.c_str(), b, saved[b], actual);
+                                dumpRegs();
+                                std::string af_json = "{\"executed\":\"ASSERT_FAILED\",\"addr\":" + std::to_string(ip)
+                                    + ",\"assert\":\"MEM_ASSERT " + s.name + "\""
+                                    + ",\"snap_name\":\"" + s.name + "\""
+                                    + ",\"mismatch_offset\":" + std::to_string(b)
+                                    + ",\"expected\":" + std::to_string(saved[b])
+                                    + ",\"actual\":" + std::to_string(actual)
+                                    + ",\"instructions\":" + std::to_string(cpu_.instr_count);
+                                if (!vram_dumps_.empty()) {
+                                    af_json += ",\"vram_dumps\":[";
+                                    for (size_t vi = 0; vi < vram_dumps_.size(); vi++) {
+                                        if (vi > 0) af_json += ",";
+                                        af_json += vram_dumps_[vi];
+                                    }
+                                    af_json += "]";
+                                }
+                                if (!reg_dumps_.empty()) {
+                                    af_json += ",\"reg_dumps\":[";
+                                    for (size_t ri = 0; ri < reg_dumps_.size(); ri++) {
+                                        if (ri > 0) af_json += ",";
+                                        af_json += reg_dumps_[ri];
+                                    }
+                                    af_json += "]";
+                                }
+                                if (!log_dumps_.empty()) {
+                                    af_json += ",\"log\":[";
+                                    for (size_t li = 0; li < log_dumps_.size(); li++) {
+                                        if (li > 0) af_json += ",";
+                                        af_json += log_dumps_[li];
+                                    }
+                                    af_json += "]";
+                                }
+                                af_json += "}";
+                                std::cout << af_json << std::endl;
+                                return 1;
+                            }
+                        }
                     }
                 }
             }
@@ -759,14 +873,30 @@ int JitEngine::run(const uint8_t* comData, size_t comSize, RunMode mode,
                         actual = cpu_.regs[a.reg_index];
                         assert_desc = a.reg_name + " == " + std::to_string(a.expected);
                         break;
-                    case DbgAssertEq::CHECK_MEM_BYTE:
-                        actual = cpu_.memory[a.mem_addr];
-                        assert_desc = "BYTE [" + std::to_string(a.mem_addr) + "] == " + std::to_string(a.expected);
+                    case DbgAssertEq::CHECK_MEM_BYTE: {
+                        uint32_t phys = a.mem_seg >= 0
+                            ? ((uint32_t)cpu_.sregs[a.mem_seg] * 16 + a.mem_addr) & 0xFFFFF
+                            : a.mem_addr;
+                        actual = cpu_.memory[phys];
+                        static const char* seg_names[] = {"ES","CS","SS","DS"};
+                        std::string addr_str = a.mem_seg >= 0
+                            ? std::string(seg_names[a.mem_seg]) + ":[" + std::to_string(a.mem_addr) + "]"
+                            : "[" + std::to_string(a.mem_addr) + "]";
+                        assert_desc = "BYTE " + addr_str + " == " + std::to_string(a.expected);
                         break;
-                    case DbgAssertEq::CHECK_MEM_WORD:
-                        actual = cpu_.memory[a.mem_addr] | (cpu_.memory[a.mem_addr + 1] << 8);
-                        assert_desc = "WORD [" + std::to_string(a.mem_addr) + "] == " + std::to_string(a.expected);
+                    }
+                    case DbgAssertEq::CHECK_MEM_WORD: {
+                        uint32_t phys = a.mem_seg >= 0
+                            ? ((uint32_t)cpu_.sregs[a.mem_seg] * 16 + a.mem_addr) & 0xFFFFF
+                            : a.mem_addr;
+                        actual = cpu_.memory[phys] | (cpu_.memory[(phys + 1) & 0xFFFFF] << 8);
+                        static const char* seg_names[] = {"ES","CS","SS","DS"};
+                        std::string addr_str = a.mem_seg >= 0
+                            ? std::string(seg_names[a.mem_seg]) + ":[" + std::to_string(a.mem_addr) + "]"
+                            : "[" + std::to_string(a.mem_addr) + "]";
+                        assert_desc = "WORD " + addr_str + " == " + std::to_string(a.expected);
                         break;
+                    }
                     }
 
                     int64_t expected_masked = a.expected;
@@ -853,6 +983,8 @@ int JitEngine::run(const uint8_t* comData, size_t comSize, RunMode mode,
                 fn(&cpu_);
                 cpu_.instr_count++;
 
+
+
                 if (instr.op == OpType::CMPSB || instr.op == OpType::CMPSW ||
                     instr.op == OpType::SCASB || instr.op == OpType::SCASW) {
                     bool zf = (cpu_.flags & F_ZF) != 0;
@@ -877,13 +1009,33 @@ int JitEngine::run(const uint8_t* comData, size_t comSize, RunMode mode,
             fn(&cpu_);
             cpu_.instr_count++;
 
+
+
             if (cpu_.pending_int != -1) {
                 int marker = cpu_.pending_int;
                 cpu_.pending_int = -1;
 
                 if (marker >= 0) {
+                    // DOS_FAIL / DOS_PARTIAL interception
+                    bool intercepted = false;
+                    if (dos_fault_.int_num == marker) {
+                        uint8_t ah = (cpu_.regs[R_AX] >> 8) & 0xFF;
+                        if ((int)ah == dos_fault_.ah_func) {
+                            if (dos_fault_.partial_count >= 0) {
+                                // DOS_PARTIAL: return partial count, CF clear
+                                cpu_.regs[R_AX] = (uint16_t)dos_fault_.partial_count;
+                                cpu_.flags &= ~0x0001;
+                            } else {
+                                // DOS_FAIL: set error
+                                cpu_.flags |= 0x0001;
+                                cpu_.regs[R_AX] = dos_fault_.fail_code;
+                            }
+                            dos_fault_.int_num = -1; // clear one-shot
+                            intercepted = true;
+                        }
+                    }
                     // DOS/BIOS interrupt
-                    if (!handleDOSInt(cpu_, marker, dos_output_, dos_state_, video_, has_events_ ? &kbd_ : nullptr, &mouse_)) {
+                    if (!intercepted && !handleDOSInt(cpu_, marker, dos_output_, dos_state_, video_, has_events_ ? &kbd_ : nullptr, &mouse_)) {
                         if (marker == 0x16) {
                             uint8_t ah = (cpu_.regs[R_AX] >> 8) & 0xFF;
                             if (ah == 0x00) {
@@ -1254,6 +1406,7 @@ void JitEngine::loadDebugInfo(const std::string& dbg_path) {
                 std::string dcheck, dreg_name;
                 int dreg_index = -1;
                 uint16_t dmem_addr = 0;
+                int dmem_seg = -1;
                 int64_t dexpected = 0;
                 // VRAMOUT fields
                 JitVramOutParams dvramout;
@@ -1262,6 +1415,16 @@ void JitEngine::loadDebugInfo(const std::string& dbg_path) {
                 // LOG fields
                 std::string dmessage;
                 std::string donce_label;
+                // DOS_FAIL/DOS_PARTIAL fields
+                int dint_num = 0;
+                int dah_func = 0;
+                int dfail_code = 5;
+                int dpartial_count = -1;
+                // MEM_SNAPSHOT/MEM_ASSERT fields
+                std::string dsnap_name;
+                int dsnap_seg = -1;
+                uint16_t dsnap_offset = 0;
+                uint16_t dsnap_length = 0;
 
                 while (pos < content.size() && content[pos] != '}') {
                     while (pos < content.size() && (content[pos] == ' ' || content[pos] == '\n' ||
@@ -1333,7 +1496,7 @@ void JitEngine::loadDebugInfo(const std::string& dbg_path) {
                             dregs = false; pos += 5; // skip "false"
                         }
                     } else if (key == "type" || key == "name" || key == "label" || key == "check" || key == "reg" ||
-                               key == "message" || key == "once_label") {
+                               key == "message" || key == "once_label" || key == "snap_name") {
                         if (pos >= content.size() || content[pos] != '"') break;
                         pos++;
                         std::string val;
@@ -1353,6 +1516,7 @@ void JitEngine::loadDebugInfo(const std::string& dbg_path) {
                         else if (key == "reg") dreg_name = val;
                         else if (key == "message") dmessage = val;
                         else if (key == "once_label") donce_label = val;
+                        else if (key == "snap_name") dsnap_name = val;
                     } else {
                         // numeric: addr, count, reg_index, mem_addr, expected
                         // Support negative numbers
@@ -1369,7 +1533,15 @@ void JitEngine::loadDebugInfo(const std::string& dbg_path) {
                         else if (key == "count") dcount = (uint32_t)val;
                         else if (key == "reg_index") dreg_index = (int)val;
                         else if (key == "mem_addr") dmem_addr = (uint16_t)val;
+                        else if (key == "mem_seg") dmem_seg = (int)val;
                         else if (key == "expected") dexpected = val;
+                        else if (key == "int_num") dint_num = (int)val;
+                        else if (key == "ah_func") dah_func = (int)val;
+                        else if (key == "fail_code") dfail_code = (int)val;
+                        else if (key == "partial_count") dpartial_count = (int)val;
+                        else if (key == "snap_seg") dsnap_seg = (int)val;
+                        else if (key == "snap_offset") dsnap_offset = (uint16_t)val;
+                        else if (key == "snap_length") dsnap_length = (uint16_t)val;
                     }
                 }
                 if (pos < content.size() && content[pos] == '}') pos++;
@@ -1395,6 +1567,7 @@ void JitEngine::loadDebugInfo(const std::string& dbg_path) {
                     a.reg_index = dreg_index;
                     a.reg_name = dreg_name;
                     a.mem_addr = dmem_addr;
+                    a.mem_seg = dmem_seg;
                     a.expected = dexpected;
                     a.vramout = dvramout;
                     a.regs = dregs;
@@ -1430,13 +1603,36 @@ void JitEngine::loadDebugInfo(const std::string& dbg_path) {
                     } else if (dcheck == "mem_byte") {
                         dl.check_kind = DbgLog::CHECK_MEM_BYTE;
                         dl.mem_addr = dmem_addr;
+                        dl.mem_seg = dmem_seg;
                     } else if (dcheck == "mem_word") {
                         dl.check_kind = DbgLog::CHECK_MEM_WORD;
                         dl.mem_addr = dmem_addr;
+                        dl.mem_seg = dmem_seg;
                     }
                     size_t idx = log_entries_.size();
                     log_entries_.push_back(dl);
                     log_addr_map_[daddr].push_back(idx);
+                } else if (dtype == "dos_fail" || dtype == "dos_partial") {
+                    DbgDosFail df;
+                    df.addr = daddr;
+                    df.int_num = (uint8_t)dint_num;
+                    df.ah_func = (uint8_t)dah_func;
+                    df.fail_code = (uint16_t)dfail_code;
+                    df.partial_count = (dtype == "dos_partial") ? dpartial_count : -1;
+                    size_t idx = dos_fails_.size();
+                    dos_fails_.push_back(df);
+                    dos_fail_addr_map_[daddr].push_back(idx);
+                } else if (dtype == "mem_snapshot" || dtype == "mem_assert") {
+                    DbgMemSnap ms;
+                    ms.addr = daddr;
+                    ms.name = dsnap_name;
+                    ms.seg = dsnap_seg;
+                    ms.offset = dsnap_offset;
+                    ms.length = dsnap_length;
+                    ms.is_assert = (dtype == "mem_assert");
+                    size_t idx = mem_snaps_.size();
+                    mem_snaps_.push_back(ms);
+                    mem_snap_addr_map_[daddr].push_back(idx);
                 }
             }
         }
@@ -1776,7 +1972,7 @@ bool JitEngine::emitInstruction(const DecodedInstr& instr) {
         // Pre-compute SS*16 → RBP for efficiency
         code_.emit8(0x0F); code_.emit8(0xB7);
         emitModRMDisp(code_, RBP, sregOff(S_SS));  // movzx ebp, word [rcx + sregOff(S_SS)]
-        code_.emit8(0xC1); code_.emit8(0xED); code_.emit8(0x04); // shl ebp, 4
+        code_.emit8(0xC1); code_.emit8(0xE5); code_.emit8(0x04); // shl ebp, 4
 
         // Push AX, CX, DX, BX, SP(original), BP, SI, DI
         for (int r = 0; r < 8; r++) {
@@ -1810,7 +2006,7 @@ bool JitEngine::emitInstruction(const DecodedInstr& instr) {
         // Pre-compute SS*16 → RBP for efficiency
         code_.emit8(0x0F); code_.emit8(0xB7);
         emitModRMDisp(code_, RBP, sregOff(S_SS));
-        code_.emit8(0xC1); code_.emit8(0xED); code_.emit8(0x04); // shl ebp, 4
+        code_.emit8(0xC1); code_.emit8(0xE5); code_.emit8(0x04); // shl ebp, 4
 
         // Pop DI, SI, BP, skip SP, BX, DX, CX, AX
         for (int r = 7; r >= 0; r--) {
@@ -2850,7 +3046,7 @@ bool JitEngine::emitInstruction(const DecodedInstr& instr) {
         // Pre-compute SS*16 → RBP
         code_.emit8(0x0F); code_.emit8(0xB7);
         emitModRMDisp(code_, RBP, sregOff(S_SS));
-        code_.emit8(0xC1); code_.emit8(0xED); code_.emit8(0x04); // shl ebp, 4
+        code_.emit8(0xC1); code_.emit8(0xE5); code_.emit8(0x04); // shl ebp, 4
 
         // Pop IP
         emitLoadReg16(RDX, R_SP);

@@ -53,7 +53,8 @@ bool Lexer::isDirective(const std::string& name) {
         "DB","DW","RESB","RESW","EQU","ORG","PROC","ENDP","INCLUDE",
         "TRACE_START","TRACE_STOP","BREAKPOINT",
         "ASSERT","HEX_START","HEX_END","PRINT","ASSERT_EQ","SCREEN","VRAMOUT","REGS",
-        "LOG","LOG_ONCE", nullptr
+        "LOG","LOG_ONCE","DOS_FAIL","DOS_PARTIAL",
+        "MEM_SNAPSHOT","MEM_ASSERT", nullptr
     };
     std::string u = toUpper(name);
     for (int i = 0; dirs[i]; i++)

@@ -5,7 +5,6 @@
 #include <string>
 #include <vector>
 #include <algorithm>
-#include <glob.h>
 
 struct DosState {
     FILE* handles[20];          // 0-4 = device sentinels, 5-19 = user files

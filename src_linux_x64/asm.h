@@ -37,7 +37,7 @@ struct VramOutParams {
 };
 
 struct DebugDirective {
-    enum Type { TRACE_START, TRACE_STOP, BREAKPOINT, ASSERT_EQ, VRAMOUT, REGS, LOG, LOG_ONCE };
+    enum Type { TRACE_START, TRACE_STOP, BREAKPOINT, ASSERT_EQ, VRAMOUT, REGS, LOG, LOG_ONCE, DOS_FAIL, DOS_PARTIAL, MEM_SNAPSHOT, MEM_ASSERT };
     Type type;
     uint16_t addr;
     uint32_t count;      // breakpoint: passes before stop (0 = immediate)
@@ -49,6 +49,7 @@ struct DebugDirective {
     int reg_index = -1;          // 0=AX..7=DI
     std::string reg_name;        // "AX" etc.
     uint16_t mem_addr = 0;       // for CHECK_MEM_*
+    int mem_seg = -1;            // segment override: -1=none, 0=ES, 1=CS, 2=SS, 3=DS
     int64_t expected = 0;
 
     // VRAMOUT params (used by VRAMOUT, BREAKPOINT:VRAMOUT, ASSERT_EQ:VRAMOUT)
@@ -60,6 +61,18 @@ struct DebugDirective {
     // LOG/LOG_ONCE fields (reuses check_kind, reg_index, reg_name, mem_addr for operand)
     std::string message;          // LOG message string
     std::string log_once_label;   // LOG_ONCE dedup label
+
+    // DOS_FAIL/DOS_PARTIAL fields
+    uint8_t int_num = 0;          // interrupt number to intercept
+    uint8_t ah_func = 0;          // AH subfunction to match
+    uint16_t fail_code = 5;       // DOS_FAIL: error code for AX (default: access denied)
+    uint16_t partial_count = 0;   // DOS_PARTIAL: byte count to return in AX
+
+    // MEM_SNAPSHOT / MEM_ASSERT fields
+    std::string snap_name;       // snapshot identifier (matches SNAPSHOT to ASSERT)
+    int snap_seg = -1;           // segment register: 0=ES, 1=CS, 2=SS, 3=DS
+    uint16_t snap_offset = 0;    // offset within segment
+    uint16_t snap_length = 0;    // number of bytes
 };
 
 struct CompilePrint {
@@ -144,6 +157,7 @@ private:
     bool in_hex_region_ = false;
     std::string screen_mode_;
     std::vector<int> pass1_sizes_;  // per-line estimated sizes from pass 1
+    bool directive_pending_ = false; // true when runtime directive at current_addr_ needs NOP before next label
 
     void error(int line, const std::string& source, const std::string& msg);
     void recordDebug(int line_index, const std::string& source_line);

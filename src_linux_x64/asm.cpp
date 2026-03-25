@@ -5,9 +5,8 @@
 #include <set>
 #include <cstring>
 #include <cstdlib>
+#include <climits>
 #include <iostream>
-
-#include <climits>   // PATH_MAX
 
 void Assembler::error(int line, const std::string& source, const std::string& msg) {
     std::string file;
@@ -310,16 +309,21 @@ ParsedLine Assembler::parseLine(const std::string& line, int line_num) {
 // --- INCLUDE helpers ---
 
 static std::string canonicalizePath(const std::string& path) {
+    // Normalize separators to forward slash
+    std::string norm = path;
+    for (auto& c : norm) {
+        if (c == '\\') c = '/';
+    }
     char resolved[PATH_MAX];
-    if (realpath(path.c_str(), resolved)) {
+    if (realpath(norm.c_str(), resolved)) {
         return std::string(resolved);
     }
-    return path;
+    return norm;
 }
 
 static std::string directoryOf(const std::string& filepath) {
     // Find last separator
-    size_t pos = filepath.find_last_of('/');
+    size_t pos = filepath.find_last_of("/\\");
     if (pos != std::string::npos) {
         return filepath.substr(0, pos + 1);
     }
@@ -556,6 +560,7 @@ bool Assembler::pass1(const std::vector<std::string>& lines) {
     pass2_ = false;
     current_addr_ = 0;
     origin_ = 0;
+    directive_pending_ = false;
     pass1_sizes_.assign(lines.size(), 0);
 
     for (int i = 0; i < (int)lines.size(); i++) {
@@ -564,6 +569,11 @@ bool Assembler::pass1(const std::vector<std::string>& lines) {
 
         // Handle label
         if (!pl.label.empty()) {
+            // NOP separator: runtime directive at this address needs 1-byte gap before label
+            if (pl.directive != "EQU" && directive_pending_) {
+                current_addr_++;
+                directive_pending_ = false;
+            }
             std::string redef;
             if (pl.is_local_label) {
                 std::string qualified = symtab_.qualify(pl.label);
@@ -592,6 +602,7 @@ bool Assembler::pass1(const std::vector<std::string>& lines) {
                 origin_ = r.value;
                 current_addr_ = r.value;
             }
+            directive_pending_ = false;
             continue;
         }
 
@@ -624,7 +635,18 @@ bool Assembler::pass1(const std::vector<std::string>& lines) {
             pl.directive == "HEX_END" || pl.directive == "PRINT" ||
             pl.directive == "ASSERT_EQ" || pl.directive == "SCREEN" ||
             pl.directive == "VRAMOUT" || pl.directive == "REGS" ||
-            pl.directive == "LOG" || pl.directive == "LOG_ONCE") {
+            pl.directive == "LOG" || pl.directive == "LOG_ONCE" ||
+            pl.directive == "DOS_FAIL" || pl.directive == "DOS_PARTIAL" ||
+            pl.directive == "MEM_SNAPSHOT" || pl.directive == "MEM_ASSERT") {
+            // Runtime directives need NOP separation from following labels
+            if (pl.directive == "TRACE_START" || pl.directive == "TRACE_STOP" ||
+                pl.directive == "BREAKPOINT" || pl.directive == "ASSERT_EQ" ||
+                pl.directive == "VRAMOUT" || pl.directive == "REGS" ||
+                pl.directive == "LOG" || pl.directive == "LOG_ONCE" ||
+                pl.directive == "DOS_FAIL" || pl.directive == "DOS_PARTIAL" ||
+                pl.directive == "MEM_SNAPSHOT" || pl.directive == "MEM_ASSERT") {
+                directive_pending_ = true;
+            }
             continue;
         }
 
@@ -640,6 +662,7 @@ bool Assembler::pass1(const std::vector<std::string>& lines) {
             ExprResult r = evalExpr(args, p);
             reportExprDiags(i + 1, lines[i]);
             current_addr_ += r.value;
+            directive_pending_ = false;
             continue;
         }
 
@@ -650,6 +673,7 @@ bool Assembler::pass1(const std::vector<std::string>& lines) {
             ExprResult r = evalExpr(args, p);
             reportExprDiags(i + 1, lines[i]);
             current_addr_ += r.value * 2;
+            directive_pending_ = false;
             continue;
         }
 
@@ -677,6 +701,7 @@ bool Assembler::pass1(const std::vector<std::string>& lines) {
                 }
             }
             current_addr_ += size;
+            directive_pending_ = false;
             continue;
         }
 
@@ -694,6 +719,7 @@ bool Assembler::pass1(const std::vector<std::string>& lines) {
                 count++;
             }
             current_addr_ += count * 2;
+            directive_pending_ = false;
             continue;
         }
 
@@ -702,6 +728,7 @@ bool Assembler::pass1(const std::vector<std::string>& lines) {
             int size = encoder_.estimateSize(pl);
             pass1_sizes_[i] = size;
             current_addr_ += size;
+            directive_pending_ = false;
         }
 
     }
@@ -713,6 +740,7 @@ bool Assembler::pass2(const std::vector<std::string>& lines, std::vector<uint8_t
     pass2_ = true;
     current_addr_ = 0;
     origin_ = 0;
+    directive_pending_ = false;
     debug_entries_.clear();
     debug_directives_.clear();
     prints_.clear();
@@ -725,6 +753,13 @@ bool Assembler::pass2(const std::vector<std::string>& lines, std::vector<uint8_t
     for (int i = 0; i < (int)lines.size(); i++) {
         ParsedLine pl = parseLine(lines[i], i + 1);
         reportExprDiags(i + 1, lines[i]);
+
+        // NOP separator: runtime directive at this address needs 1-byte gap before label
+        if (!pl.label.empty() && pl.directive != "EQU" && directive_pending_) {
+            output.push_back(0x90);
+            current_addr_++;
+            directive_pending_ = false;
+        }
 
         // Handle label scope (same as pass 1)
         if (!pl.label.empty() && !pl.is_local_label && pl.directive != "EQU") {
@@ -742,6 +777,7 @@ bool Assembler::pass2(const std::vector<std::string>& lines, std::vector<uint8_t
                 origin_ = r.value;
                 current_addr_ = r.value;
             }
+            directive_pending_ = false;
             continue;
         }
 
@@ -765,11 +801,13 @@ bool Assembler::pass2(const std::vector<std::string>& lines, std::vector<uint8_t
         if (pl.directive == "TRACE_START") {
             debug_directives_.push_back({DebugDirective::TRACE_START,
                                          (uint16_t)current_addr_, 0, ""});
+            directive_pending_ = true;
             continue;
         }
         if (pl.directive == "TRACE_STOP") {
             debug_directives_.push_back({DebugDirective::TRACE_STOP,
                                          (uint16_t)current_addr_, 0, ""});
+            directive_pending_ = true;
             continue;
         }
         if (pl.directive == "BREAKPOINT") {
@@ -821,6 +859,7 @@ bool Assembler::pass2(const std::vector<std::string>& lines, std::vector<uint8_t
             dd.vramout = bp_mods.vramout;
             dd.regs = bp_mods.regs;
             debug_directives_.push_back(dd);
+            directive_pending_ = true;
             continue;
         }
 
@@ -976,6 +1015,23 @@ bool Assembler::pass2(const std::vector<std::string>& lines, std::vector<uint8_t
                 dd.check_kind = is_byte ? DebugDirective::CHECK_MEM_BYTE : DebugDirective::CHECK_MEM_WORD;
                 apos = 1;
 
+                // Check for segment override: BYTE ES:[addr]
+                int seg_override = -1;
+                if (apos < work_args.size() && work_args[apos].type == TokenType::REGISTER) {
+                    std::string sreg_name = Lexer::toUpper(work_args[apos].text);
+                    for (auto& si : SREG_TABLE) {
+                        if (sreg_name == si.name) {
+                            seg_override = (int)si.sreg;
+                            break;
+                        }
+                    }
+                    if (seg_override >= 0) {
+                        apos++; // skip segment register
+                        if (apos < work_args.size() && work_args[apos].type == TokenType::COLON)
+                            apos++; // skip ':'
+                    }
+                }
+
                 // Expect '['
                 if (apos >= work_args.size() || work_args[apos].type != TokenType::OPEN_BRACKET) {
                     error(i + 1, lines[i], "ASSERT_EQ: expected '[' after " + first_upper);
@@ -999,6 +1055,7 @@ bool Assembler::pass2(const std::vector<std::string>& lines, std::vector<uint8_t
                     continue;
                 }
                 dd.mem_addr = (uint16_t)r.value;
+                dd.mem_seg = seg_override;
 
                 // Skip comma
                 if (apos < work_args.size() && work_args[apos].type == TokenType::COMMA) apos++;
@@ -1049,6 +1106,7 @@ bool Assembler::pass2(const std::vector<std::string>& lines, std::vector<uint8_t
             }
 
             debug_directives_.push_back(dd);
+            directive_pending_ = true;
             continue;
         }
 
@@ -1081,6 +1139,7 @@ bool Assembler::pass2(const std::vector<std::string>& lines, std::vector<uint8_t
             dd.count = 0;
             dd.vramout = vp;
             debug_directives_.push_back(dd);
+            directive_pending_ = true;
             continue;
         }
 
@@ -1092,6 +1151,7 @@ bool Assembler::pass2(const std::vector<std::string>& lines, std::vector<uint8_t
             dd.count = 0;
             dd.regs = true;
             debug_directives_.push_back(dd);
+            directive_pending_ = true;
             continue;
         }
 
@@ -1146,6 +1206,23 @@ bool Assembler::pass2(const std::vector<std::string>& lines, std::vector<uint8_t
                         dd.check_kind = is_byte ? DebugDirective::CHECK_MEM_BYTE : DebugDirective::CHECK_MEM_WORD;
                         apos++;
 
+                        // Check for segment override: BYTE ES:[addr]
+                        int seg_override = -1;
+                        if (apos < args.size() && args[apos].type == TokenType::REGISTER) {
+                            std::string sreg_name = Lexer::toUpper(args[apos].text);
+                            for (auto& si : SREG_TABLE) {
+                                if (sreg_name == si.name) {
+                                    seg_override = (int)si.sreg;
+                                    break;
+                                }
+                            }
+                            if (seg_override >= 0) {
+                                apos++; // skip segment register
+                                if (apos < args.size() && args[apos].type == TokenType::COLON)
+                                    apos++; // skip ':'
+                            }
+                        }
+
                         if (apos >= args.size() || args[apos].type != TokenType::OPEN_BRACKET) {
                             error(i + 1, lines[i], std::string(pl.directive) + ": expected '[' after " + first_upper);
                             continue;
@@ -1167,6 +1244,7 @@ bool Assembler::pass2(const std::vector<std::string>& lines, std::vector<uint8_t
                             continue;
                         }
                         dd.mem_addr = (uint16_t)r.value;
+                        dd.mem_seg = seg_override;
                     } else {
                         // Check for 16-bit register
                         bool found_reg = false;
@@ -1189,6 +1267,205 @@ bool Assembler::pass2(const std::vector<std::string>& lines, std::vector<uint8_t
             }
 
             debug_directives_.push_back(dd);
+            directive_pending_ = true;
+            continue;
+        }
+
+        // DOS_FAIL / DOS_PARTIAL — one-shot DOS failure injection
+        // DOS_FAIL int_num, ah_func [, error_code]
+        // DOS_PARTIAL int_num, ah_func, count
+        if (pl.directive == "DOS_FAIL" || pl.directive == "DOS_PARTIAL") {
+            auto& args = pl.directive_args;
+            bool is_partial = (pl.directive == "DOS_PARTIAL");
+
+            DebugDirective dd;
+            dd.type = is_partial ? DebugDirective::DOS_PARTIAL : DebugDirective::DOS_FAIL;
+            dd.addr = (uint16_t)current_addr_;
+            dd.count = 0;
+
+            size_t apos = 0;
+
+            // Parse int_num (required)
+            if (apos >= args.size() || args[apos].type == TokenType::EOL) {
+                error(i + 1, lines[i], std::string(pl.directive) + " requires interrupt number");
+                continue;
+            }
+            {
+                std::vector<Token> expr_tokens;
+                while (apos < args.size() && args[apos].type != TokenType::COMMA && args[apos].type != TokenType::EOL)
+                    expr_tokens.push_back(args[apos++]);
+                expr_tokens.push_back({TokenType::EOL, ""});
+                size_t p = 0;
+                ExprResult r = evalExpr(expr_tokens, p);
+                reportExprDiags(i + 1, lines[i]);
+                if (!r.resolved) {
+                    error(i + 1, lines[i], std::string(pl.directive) + ": unresolved interrupt number");
+                    continue;
+                }
+                dd.int_num = (uint8_t)r.value;
+            }
+
+            // Skip comma
+            if (apos < args.size() && args[apos].type == TokenType::COMMA) apos++;
+
+            // Parse ah_func (required)
+            if (apos >= args.size() || args[apos].type == TokenType::EOL) {
+                error(i + 1, lines[i], std::string(pl.directive) + " requires AH function number");
+                continue;
+            }
+            {
+                std::vector<Token> expr_tokens;
+                while (apos < args.size() && args[apos].type != TokenType::COMMA && args[apos].type != TokenType::EOL)
+                    expr_tokens.push_back(args[apos++]);
+                expr_tokens.push_back({TokenType::EOL, ""});
+                size_t p = 0;
+                ExprResult r = evalExpr(expr_tokens, p);
+                reportExprDiags(i + 1, lines[i]);
+                if (!r.resolved) {
+                    error(i + 1, lines[i], std::string(pl.directive) + ": unresolved AH function number");
+                    continue;
+                }
+                dd.ah_func = (uint8_t)r.value;
+            }
+
+            // Skip comma
+            if (apos < args.size() && args[apos].type == TokenType::COMMA) apos++;
+
+            if (is_partial) {
+                // DOS_PARTIAL: count is required
+                if (apos >= args.size() || args[apos].type == TokenType::EOL) {
+                    error(i + 1, lines[i], "DOS_PARTIAL requires a byte count");
+                    continue;
+                }
+                std::vector<Token> expr_tokens;
+                while (apos < args.size() && args[apos].type != TokenType::COMMA && args[apos].type != TokenType::EOL)
+                    expr_tokens.push_back(args[apos++]);
+                expr_tokens.push_back({TokenType::EOL, ""});
+                size_t p = 0;
+                ExprResult r = evalExpr(expr_tokens, p);
+                reportExprDiags(i + 1, lines[i]);
+                if (!r.resolved) {
+                    error(i + 1, lines[i], "DOS_PARTIAL: unresolved byte count");
+                    continue;
+                }
+                dd.partial_count = (uint16_t)r.value;
+            } else {
+                // DOS_FAIL: optional error_code (default 5)
+                if (apos < args.size() && args[apos].type != TokenType::EOL) {
+                    std::vector<Token> expr_tokens;
+                    while (apos < args.size() && args[apos].type != TokenType::COMMA && args[apos].type != TokenType::EOL)
+                        expr_tokens.push_back(args[apos++]);
+                    expr_tokens.push_back({TokenType::EOL, ""});
+                    size_t p = 0;
+                    ExprResult r = evalExpr(expr_tokens, p);
+                    reportExprDiags(i + 1, lines[i]);
+                    if (!r.resolved) {
+                        error(i + 1, lines[i], "DOS_FAIL: unresolved error code");
+                        continue;
+                    }
+                    dd.fail_code = (uint16_t)r.value;
+                }
+            }
+
+            debug_directives_.push_back(dd);
+            directive_pending_ = true;
+            continue;
+        }
+
+        // MEM_SNAPSHOT / MEM_ASSERT — memory region snapshot and comparison
+        // MEM_SNAPSHOT name, SEG_REG, offset_expr, length_expr
+        // MEM_ASSERT   name, SEG_REG, offset_expr, length_expr
+        if (pl.directive == "MEM_SNAPSHOT" || pl.directive == "MEM_ASSERT") {
+            auto& args = pl.directive_args;
+            bool is_assert = (pl.directive == "MEM_ASSERT");
+
+            DebugDirective dd;
+            dd.type = is_assert ? DebugDirective::MEM_ASSERT : DebugDirective::MEM_SNAPSHOT;
+            dd.addr = (uint16_t)current_addr_;
+            dd.count = 0;
+
+            size_t apos = 0;
+
+            // Parse name (required — any non-EOL, non-COMMA token)
+            if (apos >= args.size() || args[apos].type == TokenType::EOL) {
+                error(i + 1, lines[i], std::string(pl.directive) + " requires a snapshot name");
+                continue;
+            }
+            dd.snap_name = args[apos].text;
+            apos++;
+
+            // Skip comma
+            if (apos < args.size() && args[apos].type == TokenType::COMMA) apos++;
+
+            // Parse segment register (required: ES, CS, SS, DS)
+            if (apos >= args.size() || args[apos].type == TokenType::EOL) {
+                error(i + 1, lines[i], std::string(pl.directive) + " requires a segment register (ES/CS/SS/DS)");
+                continue;
+            }
+            std::string seg_str = args[apos].text;
+            for (auto& c : seg_str) c = (char)toupper((unsigned char)c);
+            if (seg_str == "ES") dd.snap_seg = 0;
+            else if (seg_str == "CS") dd.snap_seg = 1;
+            else if (seg_str == "SS") dd.snap_seg = 2;
+            else if (seg_str == "DS") dd.snap_seg = 3;
+            else {
+                error(i + 1, lines[i], std::string(pl.directive) + ": unknown segment register '" + args[apos].text + "' (expected ES/CS/SS/DS)");
+                continue;
+            }
+            apos++;
+
+            // Skip comma
+            if (apos < args.size() && args[apos].type == TokenType::COMMA) apos++;
+
+            // Parse offset expression (required)
+            if (apos >= args.size() || args[apos].type == TokenType::EOL) {
+                error(i + 1, lines[i], std::string(pl.directive) + " requires an offset expression");
+                continue;
+            }
+            {
+                std::vector<Token> expr_tokens;
+                while (apos < args.size() && args[apos].type != TokenType::COMMA && args[apos].type != TokenType::EOL)
+                    expr_tokens.push_back(args[apos++]);
+                expr_tokens.push_back({TokenType::EOL, ""});
+                size_t p = 0;
+                ExprResult r = evalExpr(expr_tokens, p);
+                reportExprDiags(i + 1, lines[i]);
+                if (!r.resolved) {
+                    error(i + 1, lines[i], std::string(pl.directive) + ": unresolved offset expression");
+                    continue;
+                }
+                dd.snap_offset = (uint16_t)r.value;
+            }
+
+            // Skip comma
+            if (apos < args.size() && args[apos].type == TokenType::COMMA) apos++;
+
+            // Parse length expression (required)
+            if (apos >= args.size() || args[apos].type == TokenType::EOL) {
+                error(i + 1, lines[i], std::string(pl.directive) + " requires a length expression");
+                continue;
+            }
+            {
+                std::vector<Token> expr_tokens;
+                while (apos < args.size() && args[apos].type != TokenType::COMMA && args[apos].type != TokenType::EOL)
+                    expr_tokens.push_back(args[apos++]);
+                expr_tokens.push_back({TokenType::EOL, ""});
+                size_t p = 0;
+                ExprResult r = evalExpr(expr_tokens, p);
+                reportExprDiags(i + 1, lines[i]);
+                if (!r.resolved) {
+                    error(i + 1, lines[i], std::string(pl.directive) + ": unresolved length expression");
+                    continue;
+                }
+                if (r.value < 1 || r.value > 65536) {
+                    error(i + 1, lines[i], std::string(pl.directive) + ": length must be 1..65536 (got " + std::to_string(r.value) + ")");
+                    continue;
+                }
+                dd.snap_length = (uint16_t)r.value;
+            }
+
+            debug_directives_.push_back(dd);
+            directive_pending_ = true;
             continue;
         }
 
@@ -1202,6 +1479,7 @@ bool Assembler::pass2(const std::vector<std::string>& lines, std::vector<uint8_t
             reportExprDiags(i + 1, lines[i]);
             for (int64_t j = 0; j < r.value; j++) output.push_back(0);
             current_addr_ += r.value;
+            directive_pending_ = false;
             continue;
         }
 
@@ -1214,6 +1492,7 @@ bool Assembler::pass2(const std::vector<std::string>& lines, std::vector<uint8_t
             reportExprDiags(i + 1, lines[i]);
             for (int64_t j = 0; j < r.value * 2; j++) output.push_back(0);
             current_addr_ += r.value * 2;
+            directive_pending_ = false;
             continue;
         }
 
@@ -1252,6 +1531,7 @@ bool Assembler::pass2(const std::vector<std::string>& lines, std::vector<uint8_t
                     j--;
                 }
             }
+            directive_pending_ = false;
             continue;
         }
 
@@ -1285,6 +1565,7 @@ bool Assembler::pass2(const std::vector<std::string>& lines, std::vector<uint8_t
                     j--; // compensate
                 }
             }
+            directive_pending_ = false;
             continue;
         }
 
@@ -1343,6 +1624,7 @@ bool Assembler::pass2(const std::vector<std::string>& lines, std::vector<uint8_t
                         output.push_back(0x90); // NOP padding
                     }
                     current_addr_ += estimated;
+                    directive_pending_ = false;
                     continue;
                 }
                 // Indirect JMP/CALL (reg/mem operand) falls through to regular encoder
@@ -1366,6 +1648,7 @@ bool Assembler::pass2(const std::vector<std::string>& lines, std::vector<uint8_t
                 output.push_back(0x90);
             }
             current_addr_ += std::max(estimated, actual);
+            directive_pending_ = false;
         }
     }
 

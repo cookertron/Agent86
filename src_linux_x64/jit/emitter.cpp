@@ -1,7 +1,9 @@
 #include "emitter.h"
 #include <cstring>
 #include <stdexcept>
+
 #include <sys/mman.h>
+#include <stdlib.h>
 
 CodeBuffer::CodeBuffer(size_t capacity) : capacity_(capacity), pos_(0) {
     buf_ = (uint8_t*)mmap(nullptr, capacity_, PROT_READ | PROT_WRITE | PROT_EXEC,
