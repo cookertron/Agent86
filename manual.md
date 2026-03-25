@@ -1,7 +1,7 @@
 # agent86 Manual
 
 Two-pass 8086 assembler and per-instruction JIT emulator targeting .COM binaries.
-Version 0.19.3.
+Version 0.20.0.
 
 For CLI usage, run `agent86 --help` or `agent86 --help <flag>`.
 
@@ -28,6 +28,8 @@ For CLI usage, run `agent86 --help` or `agent86 --help <flag>`.
   - [VRAMOUT](#vramout)
   - [REGS](#regs)
   - [LOG / LOG_ONCE](#log--log_once)
+  - [DOS_FAIL / DOS_PARTIAL](#dos_fail--dos_partial)
+  - [MEM_SNAPSHOT / MEM_ASSERT](#mem_snapshot--mem_assert)
   - [Modifier Chaining](#modifier-chaining)
 - [Instruction Reference](#instruction-reference)
   - [Data Movement](#data-movement)
@@ -86,7 +88,7 @@ agent86 --help <topic>
 
 The optional `[N]` on execution modes sets the instruction cycle limit (default: 100,000,000). Programs terminate with an error if they exceed this limit.
 
-The difference between `--run` and `--trace`: `--run` executes silently (ignores `.dbg`). `--trace` loads the `.dbg` file and honors runtime debug directives (TRACE_START/TRACE_STOP, BREAKPOINT, ASSERT_EQ, VRAMOUT, REGS, LOG). If no directives are present, `--trace` behaves identically to `--run`.
+The difference between `--run` and `--trace`: `--run` executes silently (ignores `.dbg`). `--trace` loads the `.dbg` file and honors runtime debug directives (TRACE_START/TRACE_STOP, BREAKPOINT, ASSERT_EQ, VRAMOUT, REGS, LOG, DOS_FAIL, DOS_PARTIAL, MEM_SNAPSHOT, MEM_ASSERT). If no directives are present, `--trace` behaves identically to `--run`.
 
 ### Flags
 
@@ -570,6 +572,166 @@ JSON entries:
 ```
 
 The label (first argument) is used for deduplication and does not need to correspond to any assembly label.
+
+### DOS_FAIL / DOS_PARTIAL
+
+One-shot DOS failure injection for testing error-handling code paths. Only honored by `--trace` / `--build_trace`.
+
+**DOS_FAIL** — arms a failure that fires on the next matching INT call:
+
+```asm
+DOS_FAIL 21h, 3Ch              ; next file create fails (CF=1, AX=5)
+DOS_FAIL 21h, 3Ch, 3           ; next file create fails (CF=1, AX=3 = path not found)
+DOS_FAIL 21h, 40h              ; next write fails (CF=1, AX=5 = access denied)
+DOS_FAIL 21h, 48h, 8           ; next memory alloc fails (CF=1, AX=8 = insufficient memory)
+```
+
+Syntax: `DOS_FAIL <int_num>, <ah_func> [, <error_code>]`
+
+- `int_num` — interrupt number (e.g., `21h`)
+- `ah_func` — AH subfunction to match (e.g., `3Ch` for create, `40h` for write)
+- `error_code` — value returned in AX (default: 5 = access denied)
+
+When the armed INT fires: the real DOS call is skipped, CF is set to 1, and AX is set to the error code.
+
+**DOS_PARTIAL** — arms a partial result that fires on the next matching INT call:
+
+```asm
+DOS_PARTIAL 21h, 40h, 10       ; next write returns only 10 bytes written
+DOS_PARTIAL 21h, 40h, 0        ; next write returns 0 bytes written
+```
+
+Syntax: `DOS_PARTIAL <int_num>, <ah_func>, <count>`
+
+- `count` — value returned in AX (simulates partial byte count)
+
+When the armed INT fires: the real DOS call is skipped, CF is cleared (success), and AX is set to the count.
+
+**One-shot behavior**: both directives fire exactly once. The armed state is cleared after the first matching INT call. Subsequent calls to the same INT/AH proceed normally. To test multiple failures, use multiple directives at different addresses.
+
+**Usage pattern** — place the directive immediately before the instruction sequence that triggers the INT:
+
+```asm
+; Test that file creation failure is handled
+    DOS_FAIL 21h, 3Ch
+    MOV AH, 3Ch
+    XOR CX, CX
+    MOV DX, filename
+    INT 21h
+    JC .handle_error        ; CF=1 — the armed failure fired
+    ; ... this path is not taken ...
+.handle_error:
+    ASSERT_EQ AX, 5         ; verify error code
+```
+
+### MEM_SNAPSHOT / MEM_ASSERT
+
+Memory region snapshot and comparison for verifying that a region of memory was NOT modified. Only honored by `--trace` / `--build_trace`.
+
+**MEM_SNAPSHOT** — capture a named copy of a memory region at the current point of execution:
+
+```asm
+MEM_SNAPSHOT <name>, <seg_reg>, <offset>, <length>
+```
+
+**MEM_ASSERT** — compare the current memory at `seg_reg:offset` against a previously captured snapshot. Halts with `ASSERT_FAILED` on first mismatch:
+
+```asm
+MEM_ASSERT <name>, <seg_reg>, <offset>, <length>
+```
+
+Parameters:
+
+| Parameter | Description |
+|-----------|-------------|
+| `name` | Identifier linking a SNAPSHOT to its ASSERT (any valid identifier) |
+| `seg_reg` | Segment register: `ES`, `CS`, `SS`, or `DS` — resolved at runtime |
+| `offset` | Offset expression (may reference labels, EQU constants, arithmetic) |
+| `length` | Number of bytes (1..65536) — may be an expression |
+
+Physical address = `seg_reg * 16 + offset`, masked to 20 bits.
+
+**Limits**: max 32 concurrent snapshots, max 65536 bytes per snapshot.
+
+**Basic usage** — verify a region is unchanged after a call:
+
+```asm
+; Snapshot the piece table before insert_char
+    MEM_SNAPSHOT pt_before, ES, 0, 100
+    CALL insert_char                    ; should be refused (table full)
+    MEM_ASSERT pt_before, ES, 0, 100   ; verify region unchanged
+```
+
+**Label-based offsets and EQU lengths**:
+
+```asm
+BUF_LEN EQU 64
+    MEM_SNAPSHOT save, DS, my_buffer, BUF_LEN
+    CALL some_operation
+    MEM_ASSERT save, DS, my_buffer, BUF_LEN
+```
+
+**Multiple independent snapshots**:
+
+```asm
+    MEM_SNAPSHOT header, DS, hdr_buf, 16
+    MEM_SNAPSHOT payload, DS, data_buf, 256
+    CALL risky_operation
+    MEM_ASSERT header, DS, hdr_buf, 16     ; verify header untouched
+    MEM_ASSERT payload, DS, data_buf, 256  ; verify payload untouched
+```
+
+**Snapshot name reuse** — recapturing with the same name overwrites the old buffer:
+
+```asm
+    MOV BYTE [buf], 0x11
+    MEM_SNAPSHOT s, DS, buf, 1        ; captures 0x11
+    MOV BYTE [buf], 0x22              ; modify
+    MEM_SNAPSHOT s, DS, buf, 1        ; recaptures: now 0x22
+    MEM_ASSERT s, DS, buf, 1          ; passes (compares against 0x22)
+```
+
+**Cross-segment verification** — in .COM, DS=ES=SS=CS all point to the same segment, so you can snapshot with one segment register and assert with another:
+
+```asm
+    MEM_SNAPSHOT s, DS, buf, 4
+    MEM_ASSERT s, ES, buf, 4          ; same physical address
+```
+
+**JSON on mismatch** — when MEM_ASSERT detects a difference:
+
+```json
+{
+  "executed": "ASSERT_FAILED",
+  "addr": 300,
+  "assert": "MEM_ASSERT pt_before",
+  "snap_name": "pt_before",
+  "mismatch_offset": 42,
+  "expected": 255,
+  "actual": 0,
+  "instructions": 5678,
+  "log": [...]
+}
+```
+
+| Field | Description |
+|-------|-------------|
+| `snap_name` | The snapshot identifier |
+| `mismatch_offset` | Byte offset within the region where the first difference was found |
+| `expected` | The byte value from the snapshot |
+| `actual` | The current byte value in memory |
+
+**JSON when snapshot name not found**:
+
+```json
+{
+  "executed": "ASSERT_FAILED",
+  "addr": 300,
+  "assert": "MEM_ASSERT nosnap (no snapshot)",
+  "snap_name": "nosnap",
+  "instructions": 0
+}
+```
 
 ### Modifier Chaining
 
@@ -1279,6 +1441,8 @@ Optional fields:
 
 ### Assert Failed
 
+**ASSERT_EQ** — value mismatch:
+
 ```json
 {"executed":"ASSERT_FAILED","addr":300,"assert":"AX == 5","actual":3,"expected":5,"instructions":75}
 ```
@@ -1287,6 +1451,20 @@ Optional fields (same as Breakpoint):
 - `"screen":{...}` — with VRAMOUT modifier
 - `"regs":{...}` — with REGS modifier
 - `"vram_dumps":[...]`, `"reg_dumps":[...]`, `"log":[...]` — accumulated data
+
+**MEM_ASSERT** — memory region mismatch:
+
+```json
+{"executed":"ASSERT_FAILED","addr":300,"assert":"MEM_ASSERT pt_before","snap_name":"pt_before","mismatch_offset":42,"expected":255,"actual":0,"instructions":75}
+```
+
+Additional fields: `snap_name` (snapshot identifier), `mismatch_offset` (byte offset of first difference), `expected` (snapshot byte), `actual` (current memory byte). Accumulated `vram_dumps`, `reg_dumps`, and `log` arrays are also included when present.
+
+**MEM_ASSERT** — missing snapshot:
+
+```json
+{"executed":"ASSERT_FAILED","addr":300,"assert":"MEM_ASSERT nosnap (no snapshot)","snap_name":"nosnap","instructions":0}
+```
 
 ### Screen Object
 
