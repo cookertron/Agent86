@@ -1,7 +1,7 @@
 # agent86 Manual
 
 Two-pass 8086 assembler and per-instruction JIT emulator targeting .COM binaries.
-Version 0.20.0.
+Version 0.21.0.
 
 For CLI usage, run `agent86 --help` or `agent86 --help <flag>`.
 
@@ -335,6 +335,38 @@ my_func ENDP
 ```asm
 SCREEN CGA80            ; enable 80x25 color text mode
 ```
+
+**SECTION .bss** — switch to the BSS (uninitialized data) section. After this directive, `RESB`/`RESW` advance the location counter and assign label addresses but emit no bytes to the `.COM` output. This allows zero-initialized variables to exist in memory at runtime without inflating the binary.
+
+```asm
+ORG 100h
+    JMP main
+msg: DB 'Hello', 0
+
+main:
+    MOV DI, buffer
+    MOV WORD [counter], 42
+    RET
+
+SECTION .bss
+buffer:  RESB 4000      ; no bytes in file
+counter: RESW 1          ; no bytes in file
+```
+
+Rules in BSS mode:
+- `RESB`/`RESW` — allowed (advance counter, emit nothing)
+- Labels, `EQU` — allowed (assigned addresses as usual)
+- `ASSERT`, `PRINT` — allowed (compile-time only)
+- `DB`/`DW` — **error** (initialized data cannot appear in BSS)
+- Instructions — **error** (code cannot appear in BSS)
+- Runtime debug directives (`BREAKPOINT`, `LOG`, etc.) — **error**
+- `INCLUDE` — allowed (included file inherits BSS mode)
+
+BSS must be the final section — once entered, it persists until end of file. Duplicate `SECTION .bss` is a no-op. The section name is case-insensitive and the dot is optional (`SECTION BSS` also works).
+
+DOS loads `.COM` files into a 64 KB segment and zeroes memory beyond the loaded bytes, so BSS labels pointing past the file end are valid and contain zero at runtime. The assembler checks that the BSS region does not exceed the 64 KB segment limit.
+
+When BSS is used, the compile JSON includes `"bss_start"` and `"bss_end"` fields (absolute segment addresses).
 
 ### INCLUDE
 
@@ -1058,6 +1090,7 @@ Requires `--screen` flag or `SCREEN` assembly directive.
 | 0Ah | Write char only | AL = char, CX = count (keeps existing attr) |
 | 0Eh | Teletype | AL = char (handles CR/LF/BS/TAB, auto-scroll) |
 | 0Fh | Get video mode | Returns AL = mode, AH = cols, BH = page |
+| 12h | Alternate select | BL=10h: EGA/VGA info → BH=00 (color), BL=03 (256KB), CH=00, CL=09 |
 
 ### INT 16h — Keyboard BIOS
 
@@ -1245,7 +1278,7 @@ In JSON strings, backslashes must be double-escaped: `\\S`, `\\C`, `\\A`.
 
 **Ctrl+letter keys**: When the Ctrl modifier is active and a letter (a-z or A-Z) is injected, the character is transformed to the corresponding control code (letter & 0x1F), producing ASCII 0x01-0x1A. For example, `\\Cc\\C` sends Ctrl+C (0x03).
 
-**Alt+letter keys**: When the Alt modifier is active and a letter (a-z/A-Z) is injected, the keystroke is stored with `ascii=0x00` and the letter's scan code, matching real BIOS behavior. This means INT 16h AH=00h returns the scan code in AH and zero in AL, and INT 21h AH=06h produces a proper two-byte extended key sequence (0x00 prefix, then scan code).
+**Alt+letter/digit keys**: When the Alt modifier is active and a letter (a-z/A-Z) or digit (0-9) is injected, the keystroke is stored with `ascii=0x00` and the key's scan code, matching real BIOS behavior. This means INT 16h AH=00h returns the scan code in AH and zero in AL, and INT 21h AH=06h produces a proper two-byte extended key sequence (0x00 prefix, then scan code). For example, `\\A5\\A` sends Alt+5 (scancode=0x06, ascii=0x00).
 
 ### Unicode Escapes
 
@@ -1373,7 +1406,13 @@ All output is a single JSON line on stdout. For `--build_run`/`--build_trace`, t
 {"compiled":"OK","size":16,"symbols":{"MSG":{"addr":265,"type":"label"},"CR":{"addr":13,"type":"equ"}}}
 ```
 
-Optional fields: `"prints":[...]`, `"hex_dumps":[...]`
+Optional fields: `"bss_start"`, `"bss_end"`, `"prints":[...]`, `"hex_dumps":[...]`
+
+**BSS fields** (present when `SECTION .bss` is used):
+```json
+{"compiled":"OK","size":79,"bss_start":335,"bss_end":4337,"symbols":{...}}
+```
+`size` is the bytes in the .COM file (code + initialized data only). `bss_start` and `bss_end` are absolute segment addresses marking the uninitialized data region.
 
 **Prints array** (from PRINT directives):
 ```json
