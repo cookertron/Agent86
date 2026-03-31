@@ -560,6 +560,8 @@ bool Assembler::pass1(const std::vector<std::string>& lines) {
     current_addr_ = 0;
     origin_ = 0;
     directive_pending_ = false;
+    in_bss_ = false;
+    bss_start_ = -1;
     pass1_sizes_.assign(lines.size(), 0);
 
     for (int i = 0; i < (int)lines.size(); i++) {
@@ -637,6 +639,13 @@ bool Assembler::pass1(const std::vector<std::string>& lines) {
             pl.directive == "LOG" || pl.directive == "LOG_ONCE" ||
             pl.directive == "DOS_FAIL" || pl.directive == "DOS_PARTIAL" ||
             pl.directive == "MEM_SNAPSHOT" || pl.directive == "MEM_ASSERT") {
+            // Block runtime directives in BSS (compile-time ones are fine)
+            if (in_bss_ && pl.directive != "ASSERT" && pl.directive != "PRINT" &&
+                pl.directive != "HEX_START" && pl.directive != "HEX_END" &&
+                pl.directive != "SCREEN") {
+                error(i + 1, lines[i], "runtime directive '" + pl.directive + "' not allowed in BSS section");
+                continue;
+            }
             // Runtime directives need NOP separation from following labels
             if (pl.directive == "TRACE_START" || pl.directive == "TRACE_STOP" ||
                 pl.directive == "BREAKPOINT" || pl.directive == "ASSERT_EQ" ||
@@ -651,6 +660,26 @@ bool Assembler::pass1(const std::vector<std::string>& lines) {
 
         if (pl.directive == "INCLUDE") {
             error(i + 1, lines[i], "unexpected INCLUDE directive (should have been expanded)");
+            continue;
+        }
+
+        if (pl.directive == "SECTION") {
+            auto& args = pl.directive_args;
+            if (args.empty()) {
+                error(i + 1, lines[i], "SECTION requires a section name (e.g., SECTION .bss)");
+                continue;
+            }
+            std::string secname = Lexer::toUpper(args[0].text);
+            if (secname == ".BSS" || secname == "BSS") {
+                if (!in_bss_) {
+                    in_bss_ = true;
+                    bss_start_ = current_addr_;
+                }
+                // Duplicate SECTION .bss is a no-op
+            } else {
+                error(i + 1, lines[i], "unknown section '" + args[0].text + "' (only .bss is supported)");
+            }
+            directive_pending_ = false;
             continue;
         }
 
@@ -677,6 +706,10 @@ bool Assembler::pass1(const std::vector<std::string>& lines) {
         }
 
         if (pl.directive == "DB") {
+            if (in_bss_) {
+                error(i + 1, lines[i], "initialized data (DB) not allowed in BSS section");
+                continue;
+            }
             int size = 0;
             std::vector<Token>& args = pl.directive_args;
             for (size_t j = 0; j < args.size(); j++) {
@@ -705,6 +738,10 @@ bool Assembler::pass1(const std::vector<std::string>& lines) {
         }
 
         if (pl.directive == "DW") {
+            if (in_bss_) {
+                error(i + 1, lines[i], "initialized data (DW) not allowed in BSS section");
+                continue;
+            }
             int count = 0;
             std::vector<Token>& args = pl.directive_args;
             for (size_t j = 0; j < args.size(); j++) {
@@ -724,12 +761,23 @@ bool Assembler::pass1(const std::vector<std::string>& lines) {
 
         // Instruction
         if (!pl.mnemonic.empty()) {
+            if (in_bss_) {
+                error(i + 1, lines[i], "instructions not allowed in BSS section");
+                continue;
+            }
             int size = encoder_.estimateSize(pl);
             pass1_sizes_[i] = size;
             current_addr_ += size;
             directive_pending_ = false;
         }
 
+    }
+
+    // Segment overflow check for BSS
+    if (in_bss_ && current_addr_ > 0xFFFF) {
+        error((int)lines.size(), "",
+              "BSS exceeds 64KB segment limit (need " +
+              std::to_string(current_addr_) + " bytes, max 65536)");
     }
 
     return errors_.empty();
@@ -740,6 +788,8 @@ bool Assembler::pass2(const std::vector<std::string>& lines, std::vector<uint8_t
     current_addr_ = 0;
     origin_ = 0;
     directive_pending_ = false;
+    in_bss_ = false;
+    bss_start_ = -1;
     debug_entries_.clear();
     debug_directives_.clear();
     prints_.clear();
@@ -796,6 +846,36 @@ bool Assembler::pass2(const std::vector<std::string>& lines, std::vector<uint8_t
         }
 
         if (pl.directive == "PROC" || pl.directive == "ENDP") continue;
+
+        // SECTION .bss
+        if (pl.directive == "SECTION") {
+            auto& args = pl.directive_args;
+            if (!args.empty()) {
+                std::string secname = Lexer::toUpper(args[0].text);
+                if (secname == ".BSS" || secname == "BSS") {
+                    if (!in_bss_) {
+                        in_bss_ = true;
+                        bss_start_ = current_addr_;
+                    }
+                } else {
+                    error(i + 1, lines[i], "unknown section '" + args[0].text + "' (only .bss is supported)");
+                }
+            }
+            directive_pending_ = false;
+            continue;
+        }
+
+        // Block runtime directives in BSS section
+        if (in_bss_ && !pl.directive.empty()) {
+            std::string d = pl.directive;
+            if (d == "TRACE_START" || d == "TRACE_STOP" || d == "BREAKPOINT" ||
+                d == "ASSERT_EQ" || d == "VRAMOUT" || d == "REGS" ||
+                d == "LOG" || d == "LOG_ONCE" || d == "DOS_FAIL" || d == "DOS_PARTIAL" ||
+                d == "MEM_SNAPSHOT" || d == "MEM_ASSERT") {
+                error(i + 1, lines[i], "runtime directive '" + d + "' not allowed in BSS section");
+                continue;
+            }
+        }
 
         if (pl.directive == "TRACE_START") {
             debug_directives_.push_back({DebugDirective::TRACE_START,
@@ -1476,7 +1556,9 @@ bool Assembler::pass2(const std::vector<std::string>& lines, std::vector<uint8_t
             size_t p = 0;
             ExprResult r = evalExpr(args, p);
             reportExprDiags(i + 1, lines[i]);
-            for (int64_t j = 0; j < r.value; j++) output.push_back(0);
+            if (!in_bss_) {
+                for (int64_t j = 0; j < r.value; j++) output.push_back(0);
+            }
             current_addr_ += r.value;
             directive_pending_ = false;
             continue;
@@ -1489,7 +1571,9 @@ bool Assembler::pass2(const std::vector<std::string>& lines, std::vector<uint8_t
             size_t p = 0;
             ExprResult r = evalExpr(args, p);
             reportExprDiags(i + 1, lines[i]);
-            for (int64_t j = 0; j < r.value * 2; j++) output.push_back(0);
+            if (!in_bss_) {
+                for (int64_t j = 0; j < r.value * 2; j++) output.push_back(0);
+            }
             current_addr_ += r.value * 2;
             directive_pending_ = false;
             continue;
@@ -1497,6 +1581,10 @@ bool Assembler::pass2(const std::vector<std::string>& lines, std::vector<uint8_t
 
         // DB
         if (pl.directive == "DB") {
+            if (in_bss_) {
+                error(i + 1, lines[i], "initialized data (DB) not allowed in BSS section");
+                continue;
+            }
             recordDebug(i + 1, lines[i]);
             std::vector<Token>& args = pl.directive_args;
             for (size_t j = 0; j < args.size(); j++) {
@@ -1536,6 +1624,10 @@ bool Assembler::pass2(const std::vector<std::string>& lines, std::vector<uint8_t
 
         // DW
         if (pl.directive == "DW") {
+            if (in_bss_) {
+                error(i + 1, lines[i], "initialized data (DW) not allowed in BSS section");
+                continue;
+            }
             recordDebug(i + 1, lines[i]);
             std::vector<Token>& args = pl.directive_args;
             for (size_t j = 0; j < args.size(); j++) {
@@ -1570,6 +1662,10 @@ bool Assembler::pass2(const std::vector<std::string>& lines, std::vector<uint8_t
 
         // Instruction
         if (!pl.mnemonic.empty()) {
+            if (in_bss_) {
+                error(i + 1, lines[i], "instructions not allowed in BSS section");
+                continue;
+            }
             recordDebug(i + 1, lines[i]);
             std::string m = Lexer::toUpper(pl.mnemonic);
 

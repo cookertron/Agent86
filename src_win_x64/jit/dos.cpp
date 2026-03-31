@@ -892,6 +892,18 @@ bool handleDOSInt(CPU8086& cpu, int intNum, std::string& output,
             cpu.regs[R_BX] = (cpu.regs[R_BX] & 0x00FF); // BH=0 (page)
             return true;
         }
+        case 0x12: {
+            // AH=12h — Alternate select (video subsystem config)
+            uint8_t bl = cpu.regs[R_BX] & 0xFF;
+            if (bl == 0x10) {
+                // BL=10h — Get EGA/VGA information
+                // BH=00h: color mode, BL=03h: 256KB video memory
+                // CH=00h: feature bits, CL=09h: switch settings (EGA/VGA color)
+                cpu.regs[R_BX] = 0x0003; // BH=0 (color), BL=3 (256KB)
+                cpu.regs[R_CX] = 0x0009; // CH=0 (features), CL=9 (switches)
+            }
+            return true;
+        }
         default:
             return false;
         }
