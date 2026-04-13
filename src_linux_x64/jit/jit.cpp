@@ -200,8 +200,11 @@ static void emitModRMDisp(CodeBuffer& c, uint8_t reg, int32_t disp) {
 }
 
 void JitEngine::emitPrologue() {
-    // RCX = CPU8086* (Win64 ABI first arg)
-    // We keep RCX as our base pointer throughout
+    // System V AMD64 ABI: first arg arrives in RDI
+    // Move to RCX, which the rest of the generated code uses as base pointer
+    code_.emit8(0x48); // REX.W
+    code_.emit8(0x89); // MOV r/m64, r64
+    code_.emit8(0xF9); // ModR/M: dst=RCX, src=RDI  →  mov rcx, rdi
     // Save RBX (callee-saved) — we use it as scratch
     code_.emit8(0x53); // push rbx
     // Save RBP (callee-saved)
